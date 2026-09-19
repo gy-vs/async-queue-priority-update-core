@@ -1,4 +1,4 @@
-import {type Queue, type RunFunction} from './queue.js';
+import {type Queue, type RunFunction, type TaskId} from './queue.js';
 import lowerBound from './lower-bound.js';
 import {type QueueAddOptions} from './options.js';
 
@@ -6,8 +6,18 @@ export type PriorityQueueOptions = {
 	priority?: number;
 } & QueueAddOptions;
 
+type Element = {
+	id?: TaskId;
+	priority: number;
+	run: RunFunction;
+	// Monotonically increasing insertion sequence number, used as a stable tie-breaker between equal priorities.
+	insertionOrder: number;
+};
+
 export default class PriorityQueue implements Queue<RunFunction, PriorityQueueOptions> {
-	readonly #queue: Array<PriorityQueueOptions & {run: RunFunction}> = [];
+	readonly #queue: Element[] = [];
+
+	#nextInsertionOrder = 0;
 
 	enqueue(run: RunFunction, options?: Partial<PriorityQueueOptions>): void {
 		options = {
@@ -15,19 +25,22 @@ export default class PriorityQueue implements Queue<RunFunction, PriorityQueueOp
 			...options,
 		};
 
-		const element = {
-			priority: options.priority,
+		const element: Element = {
+			id: options.id,
+			priority: options.priority!,
 			run,
+			insertionOrder: this.#nextInsertionOrder++,
 		};
 
-		if (this.size && this.#queue[this.size - 1]!.priority! >= options.priority!) {
+		if (this.size && this.#queue[this.size - 1]!.priority >= options.priority!) {
 			this.#queue.push(element);
 			return;
 		}
 
 		const index = lowerBound(
 			this.#queue, element,
-			(a: Readonly<PriorityQueueOptions>, b: Readonly<PriorityQueueOptions>) => b.priority! - a.priority!,
+			(a: Readonly<Element>, b: Readonly<Element>) =>
+				(b.priority - a.priority) || (a.insertionOrder - b.insertionOrder),
 		);
 		this.#queue.splice(index, 0, element);
 	}
@@ -41,6 +54,25 @@ export default class PriorityQueue implements Queue<RunFunction, PriorityQueueOp
 		return this.#queue.filter(
 			(element: Readonly<PriorityQueueOptions>) => element.priority === options.priority,
 		).map((element: Readonly<{run: RunFunction}>) => element.run);
+	}
+
+	setPriority(id: TaskId, priority: number): void {
+		const index = this.#queue.findIndex(element => element.id === id);
+
+		if (index === -1) {
+			throw new Error(`No task with the id \`${String(id)}\` is waiting in the queue`);
+		}
+
+		const [element] = this.#queue.splice(index, 1);
+		element!.priority = priority;
+
+		const newIndex = lowerBound(
+			this.#queue,
+			element!,
+			(a: Readonly<Element>, b: Readonly<Element>) =>
+				(b.priority - a.priority) || (a.insertionOrder - b.insertionOrder),
+		);
+		this.#queue.splice(newIndex, 0, element!);
 	}
 
 	get size(): number {

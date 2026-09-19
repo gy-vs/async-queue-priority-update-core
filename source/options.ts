@@ -1,4 +1,4 @@
-import {type Queue, type RunFunction} from './queue.js';
+import {type Queue, type RunFunction, type TaskId} from './queue.js';
 
 type TimeoutOptions = {
 	/**
@@ -32,7 +32,7 @@ export type Options<QueueType extends Queue<RunFunction, QueueOptions>, QueueOpt
 	readonly autoStart?: boolean;
 
 	/**
-	Class with a `enqueue` and `dequeue` method, and a `size` getter. See the [Custom QueueClass](https://github.com/sindresorhus/p-queue#custom-queueclass) section.
+	Class with `enqueue`, `dequeue`, and `setPriority` methods, and a `size` getter. See the [Custom QueueClass](https://github.com/sindresorhus/p-queue#custom-queueclass) section.
 	*/
 	readonly queueClass?: new () => QueueType;
 
@@ -63,6 +63,13 @@ export type Options<QueueType extends Queue<RunFunction, QueueOptions>, QueueOpt
 } & TimeoutOptions;
 
 export type QueueAddOptions = {
+	/**
+	Explicit identifier for the operation. Required to change its priority later with `queue.setPriority()`.
+
+	An id must be unique among tasks that are waiting in the queue or currently running. Adding a task with an id that is already in use throws an error. The id can be reused after the task has finished.
+	*/
+	readonly id?: TaskId;
+
 	/**
 	Priority of operation. Operations with greater priority will be scheduled first.
 

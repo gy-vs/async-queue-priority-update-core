@@ -85,7 +85,7 @@ Whether queue tasks within concurrency limit, are auto-executed as soon as they'
 
 Type: `Function`
 
-Class with a `enqueue` and `dequeue` method, and a `size` getter. See the [Custom QueueClass](#custom-queueclass) section.
+Class with `enqueue`, `dequeue`, and `setPriority` methods, and a `size` getter. See the [Custom QueueClass](#custom-queueclass) section.
 
 ##### intervalCap
 
@@ -131,6 +131,25 @@ Promise-returning/async function. When executed, it will receive `{signal}` as t
 #### options
 
 Type: `object`
+
+##### id
+
+Type: `string | number`
+
+Explicit identifier for the operation. Required if you want to change its priority later with [`queue.setPriority()`](#setpriorityid-priority).
+
+An `id` must be unique among tasks that are waiting in the queue or currently running. Adding a task with an `id` that is already in use rejects with an error. The `id` can be reused after the task has finished.
+
+```js
+import PQueue from 'p-queue';
+
+const queue = new PQueue({concurrency: 1});
+
+queue.add(() => fetchUser(), {id: 'fetch-user', priority: 0});
+
+// Bump the waiting task to the front
+queue.setPriority('fetch-user', 10);
+```
 
 ##### priority
 
@@ -187,6 +206,33 @@ Put queue execution on hold.
 Start (or resume) executing enqueued tasks within concurrency limit. No need to call this if queue is not paused (via `options.autoStart = false` or by `.pause()` method.)
 
 Returns `this` (the instance).
+
+#### .setPriority(id, priority)
+
+Updates the priority of a waiting task, identified by the explicit [`id`](#id) given to `.add()`. The queue's execution order immediately reflects the new priority.
+
+The task's promise and options are unchanged, and setting the same priority preserves its original insertion order relative to the other tasks at that priority.
+
+It throws if:
+
+- `priority` is not a finite number (`TypeError`).
+- `id` is not a string or number (`TypeError`).
+- No waiting task has that `id` — for example, the task has already finished or was added without an `id`.
+- The task has already started running. Only tasks still waiting in the queue can be reprioritized.
+
+```js
+import PQueue from 'p-queue';
+
+const queue = new PQueue({concurrency: 1, autoStart: false});
+
+queue.add(task1, {id: 'task-1'});
+queue.add(task2, {id: 'task-2'});
+
+queue.setPriority('task-2', 10);
+
+queue.start();
+// `task2` runs first
+```
 
 #### .onEmpty()
 
@@ -461,11 +507,21 @@ class QueueClass {
 	}
 
 	enqueue(run, options) {
-		this._queue.push(run);
+		this._queue.push({run, options});
 	}
 
 	dequeue() {
-		return this._queue.shift();
+		return this._queue.shift().run;
+	}
+
+	setPriority(id, priority) {
+		const item = this._queue.find(element => element.options.id === id);
+
+		if (!item) {
+			throw new Error(`No waiting task with the id \`${id}\``);
+		}
+
+		item.options.priority = priority;
 	}
 
 	get size() {
@@ -480,7 +536,7 @@ class QueueClass {
 const queue = new PQueue({queueClass: QueueClass});
 ```
 
-`p-queue` will call corresponding methods to put and get operations from this queue.
+`p-queue` will call corresponding methods to put and get operations from the queue. `setPriority(id, priority)` is called by [`queue.setPriority()`](#setpriorityid-priority) and must update the priority of the waiting task with the matching `id` (and its position in the dequeue order) without mutating the task's run function or any other options. It must throw if no waiting task matches the `id`; `p-queue` itself rejects attempts to target running or finished tasks before delegating.
 
 ## FAQ
 

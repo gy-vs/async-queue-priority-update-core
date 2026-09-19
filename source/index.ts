@@ -1,6 +1,6 @@
 import {EventEmitter} from 'eventemitter3';
 import pTimeout, {TimeoutError} from 'p-timeout';
-import {type Queue, type RunFunction} from './queue.js';
+import {type Queue, type RunFunction, type TaskId} from './queue.js';
 import PriorityQueue from './priority-queue.js';
 import {type QueueAddOptions, type Options, type TaskOptions} from './options.js';
 
@@ -42,6 +42,12 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	#isPaused: boolean;
 
 	readonly #throwOnTimeout: boolean;
+
+	// Explicit ids of tasks that are still waiting in the queue.
+	readonly #waitingIds = new Set<TaskId>();
+
+	// Explicit ids of tasks that have started and are still running.
+	readonly #pendingIds = new Set<TaskId>();
 
 	/**
 	Per-operation timeout in milliseconds. Operations fulfill once `timeout` elapses if they haven't already.
@@ -240,8 +246,33 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 			...options,
 		};
 
+		const {id} = options;
+
+		if (id !== undefined) {
+			if (typeof id === 'number' && Number.isNaN(id)) {
+				throw new TypeError('Expected `id` to be a string or a number other than `NaN`');
+			}
+
+			if (typeof id !== 'string' && typeof id !== 'number') {
+				throw new TypeError(`Expected \`id\` to be a string or number, got \`${String(id)}\` (${typeof id})`);
+			}
+
+			if (this.#waitingIds.has(id) || this.#pendingIds.has(id)) {
+				throw new Error(`A task with the id \`${String(id)}\` is already queued or running`);
+			}
+		}
+
 		return new Promise((resolve, reject) => {
+			if (id !== undefined) {
+				this.#waitingIds.add(id);
+			}
+
 			this.#queue.enqueue(async () => {
+				if (id !== undefined) {
+					this.#waitingIds.delete(id);
+					this.#pendingIds.add(id);
+				}
+
 				this.#pending++;
 				this.#intervalCount++;
 
@@ -270,6 +301,10 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 					reject(error);
 					this.emit('error', error);
 				} finally {
+					if (id !== undefined) {
+						this.#pendingIds.delete(id);
+					}
+
 					this.#next();
 				}
 			}, options);
@@ -322,10 +357,43 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	}
 
 	/**
+	Update the priority of a waiting task.
+
+	The task is identified by the explicit `id` given to `.add()`, and it must still be waiting in the queue. The new priority takes effect immediately: the queue's dequeue order reflects it on the next start. The task's promise and options are unaffected, and updating to the same priority preserves its original insertion order among tasks of that priority.
+
+	@param id - The `id` of the task as given to `.add()`.
+	@param priority - New priority. Must be a finite number.
+	*/
+	setPriority(id: TaskId, priority: number): void {
+		if (typeof id === 'number' && Number.isNaN(id)) {
+			throw new TypeError('Expected `id` to be a string or a number other than `NaN`');
+		}
+
+		if (typeof id !== 'string' && typeof id !== 'number') {
+			throw new TypeError(`Expected \`id\` to be a string or number, got \`${String(id)}\` (${typeof id})`);
+		}
+
+		if (!(typeof priority === 'number' && Number.isFinite(priority))) {
+			throw new TypeError(`Expected \`priority\` to be a finite number, got \`${priority}\` (${typeof priority})`);
+		}
+
+		if (this.#pendingIds.has(id)) {
+			throw new Error(`Cannot update the priority of task \`${String(id)}\` because it has already started running`);
+		}
+
+		if (!this.#waitingIds.has(id)) {
+			throw new Error(`No waiting task with the id \`${String(id)}\`. It may have finished, never had an explicit \`id\`, or never been added`);
+		}
+
+		this.#queue.setPriority(id, priority);
+	}
+
+	/**
 	Clear the queue.
 	*/
 	clear(): void {
 		this.#queue = new this.#queueClass();
+		this.#waitingIds.clear();
 	}
 
 	/**
@@ -419,5 +487,5 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	}
 }
 
-export type {Queue} from './queue.js';
+export type {Queue, TaskId} from './queue.js';
 export {type QueueAddOptions, type Options} from './options.js';
