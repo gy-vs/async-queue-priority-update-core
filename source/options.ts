@@ -64,6 +64,15 @@ export type Options<QueueType extends Queue<RunFunction, QueueOptions>, QueueOpt
 
 export type QueueAddOptions = {
 	/**
+	Unique identifier for the operation.
+
+	It can be used to change the priority of a waiting operation with `queue.setPriority()`. It cannot be reused while another operation (waiting or running) with the same `id` exists.
+
+	Operations added without an `id` cannot be targeted by `queue.setPriority()`.
+	*/
+	readonly id?: string | number;
+
+	/**
 	Priority of operation. Operations with greater priority will be scheduled first.
 
 	@default 0

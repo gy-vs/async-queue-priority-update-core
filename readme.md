@@ -132,6 +132,16 @@ Promise-returning/async function. When executed, it will receive `{signal}` as t
 
 Type: `object`
 
+##### id
+
+Type: `string | number`
+
+Unique identifier for the operation. It is used to change the priority of a waiting operation with [`.setPriority()`](#setpriorityid-priority).
+
+The same `id` cannot be reused while another operation with that `id` is still queued or running; adding one throws an error. The `id` becomes available again once the operation has finished.
+
+Operations added without an `id` cannot be targeted by `.setPriority()`.
+
 ##### priority
 
 Type: `number`\
@@ -177,6 +187,30 @@ try {
 #### .addAll(fns, options?)
 
 Same as `.add()`, but accepts an array of sync or async functions and returns a promise that resolves when all functions are resolved.
+
+#### .setPriority(id, priority)
+
+Change the priority of a waiting operation identified by the [`id`](#id) it was added with.
+
+Only operations that have not started running can be updated. The updated order is reflected immediately: when a running operation finishes, the next operation to start is the waiting one with the highest priority. Operations with the same priority keep their original insertion order, even after an update. The operation keeps its original Promise (the one returned by `.add()`) and options; only its position in the queue changes.
+
+Throws an error if the `id` is not found, the operation has already started running, or the operation was added without an explicit `id`. Throws a `TypeError` if `priority` is not a finite number.
+
+```js
+import PQueue from 'p-queue';
+
+const queue = new PQueue({concurrency: 1, autoStart: false});
+
+queue.add(() => 'first', {id: 'first'});
+queue.add(() => 'second', {id: 'second'});
+
+queue.setPriority('second', 1);
+
+queue.start();
+//=> 'second' runs before 'first'
+```
+
+To support this method with a [custom QueueClass](#custom-queueclass), implement an optional `setPriority(id, priority)` method.
 
 #### .pause()
 
@@ -461,11 +495,11 @@ class QueueClass {
 	}
 
 	enqueue(run, options) {
-		this._queue.push(run);
+		this._queue.push({run, ...options});
 	}
 
 	dequeue() {
-		return this._queue.shift();
+		return this._queue.shift().run;
 	}
 
 	get size() {
@@ -473,7 +507,17 @@ class QueueClass {
 	}
 
 	filter(options) {
-		return this._queue;
+		return this._queue.filter(element => element.priority === options.priority).map(element => element.run);
+	}
+
+	setPriority(id, priority) {
+		const item = this._queue.find(element => element.id === id);
+
+		if (!item) {
+			throw new Error(`No waiting operation with the given \`id\` exists: \`${id}\``);
+		}
+
+		item.priority = priority;
 	}
 }
 
@@ -481,6 +525,8 @@ const queue = new PQueue({queueClass: QueueClass});
 ```
 
 `p-queue` will call corresponding methods to put and get operations from this queue.
+
+The `setPriority(id, priority)` method is optional and only required to support [`queue.setPriority()`](#setpriorityid-priority). It must update the priority of the waiting item with the given `id` in place (keeping its run function and options) and throw if no waiting item has that `id`. `p-queue` itself rejects duplicate ids, ids of running operations and non-finite priorities before calling this method.
 
 ## FAQ
 

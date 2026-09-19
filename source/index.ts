@@ -36,6 +36,12 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 	#pending = 0;
 
+	// Explicit ids of tasks that are still waiting in the queue.
+	readonly #waitingIds = new Set<string | number>();
+
+	// Explicit ids of tasks that have already started running.
+	readonly #runningIds = new Set<string | number>();
+
 	// The `!` is needed because of https://github.com/microsoft/TypeScript/issues/32194
 	#concurrency!: number;
 
@@ -240,10 +246,27 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 			...options,
 		};
 
+		if (options.id !== undefined) {
+			if (typeof options.id !== 'string' && typeof options.id !== 'number') {
+				throw new TypeError(`Expected \`id\` to be a string or number, got \`${String(options.id)}\` (${typeof options.id})`);
+			}
+
+			if (this.#waitingIds.has(options.id) || this.#runningIds.has(options.id)) {
+				throw new Error(`An operation with the given \`id\` is already queued or running: \`${options.id.toString()}\``);
+			}
+
+			this.#waitingIds.add(options.id);
+		}
+
 		return new Promise((resolve, reject) => {
 			this.#queue.enqueue(async () => {
 				this.#pending++;
 				this.#intervalCount++;
+
+				if (options.id !== undefined) {
+					this.#waitingIds.delete(options.id);
+					this.#runningIds.add(options.id);
+				}
 
 				try {
 					options.signal?.throwIfAborted();
@@ -270,6 +293,10 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 					reject(error);
 					this.emit('error', error);
 				} finally {
+					if (options.id !== undefined) {
+						this.#runningIds.delete(options.id);
+					}
+
 					this.#next();
 				}
 			}, options);
@@ -326,6 +353,41 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	*/
 	clear(): void {
 		this.#queue = new this.#queueClass();
+		this.#waitingIds.clear();
+	}
+
+	/**
+	Change the priority of a waiting operation identified by its explicit `id`.
+
+	Only operations that have not started yet can be updated. The operation keeps
+	its original Promise, options and relative order among operations with the
+	same priority; the new execution order is reflected immediately.
+
+	@param id - The `id` given to the operation in `.add()`.
+	@param priority - New priority. Must be a finite number.
+	*/
+	setPriority(id: string | number, priority: number): void {
+		if (typeof id !== 'string' && typeof id !== 'number') {
+			throw new TypeError(`Expected \`id\` to be a string or number, got \`${String(id)}\` (${typeof id})`);
+		}
+
+		if (typeof priority !== 'number' || !Number.isFinite(priority)) {
+			throw new TypeError(`Expected \`priority\` to be a finite number, got \`${priority}\` (${typeof priority})`);
+		}
+
+		if (this.#runningIds.has(id)) {
+			throw new Error(`Cannot change the priority of an operation that has already started running: \`${id.toString()}\``);
+		}
+
+		if (!this.#waitingIds.has(id)) {
+			throw new Error(`No waiting operation with the given \`id\` exists: \`${id.toString()}\``);
+		}
+
+		if (this.#queue.setPriority === undefined) {
+			throw new Error('The configured `queueClass` does not implement `setPriority()`, which is required to change the priority of a waiting operation');
+		}
+
+		this.#queue.setPriority(id, priority);
 	}
 
 	/**

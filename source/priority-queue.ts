@@ -6,8 +6,17 @@ export type PriorityQueueOptions = {
 	priority?: number;
 } & QueueAddOptions;
 
+type Element = {
+	id?: string | number;
+	priority?: number;
+	order: number;
+	run: RunFunction;
+};
+
 export default class PriorityQueue implements Queue<RunFunction, PriorityQueueOptions> {
-	readonly #queue: Array<PriorityQueueOptions & {run: RunFunction}> = [];
+	readonly #queue: Element[] = [];
+
+	#enqueueCount = 0;
 
 	enqueue(run: RunFunction, options?: Partial<PriorityQueueOptions>): void {
 		options = {
@@ -15,8 +24,10 @@ export default class PriorityQueue implements Queue<RunFunction, PriorityQueueOp
 			...options,
 		};
 
-		const element = {
+		const element: Element = {
+			id: options.id,
 			priority: options.priority,
+			order: this.#enqueueCount++,
 			run,
 		};
 
@@ -41,6 +52,36 @@ export default class PriorityQueue implements Queue<RunFunction, PriorityQueueOp
 		return this.#queue.filter(
 			(element: Readonly<PriorityQueueOptions>) => element.priority === options.priority,
 		).map((element: Readonly<{run: RunFunction}>) => element.run);
+	}
+
+	/**
+	Update the priority of the waiting item with the given `id`.
+
+	The item keeps its original `run`, options, `id` and insertion order, so
+	items at the same priority keep their relative order.
+	*/
+	setPriority(id: string | number, priority: number): void {
+		const index = this.#queue.findIndex(element => element.id === id);
+
+		if (index === -1) {
+			throw new Error(`No waiting operation with the given \`id\` exists: \`${id.toString()}\``);
+		}
+
+		const [element] = this.#queue.splice(index, 1) as [Element];
+		element.priority = priority;
+
+		const targetIndex = lowerBound(
+			this.#queue, element,
+			(a: Element, b: Element) => {
+				if (b.priority !== a.priority) {
+					return b.priority! - a.priority!;
+				}
+
+				// Same priority keeps the original insertion order, even after an update.
+				return a.order - b.order;
+			},
+		);
+		this.#queue.splice(targetIndex, 0, element);
 	}
 
 	get size(): number {

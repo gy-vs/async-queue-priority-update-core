@@ -92,19 +92,6 @@ test('.add() - update concurrency', async t => {
 	await Promise.all(input);
 });
 
-test('.add() - priority', async t => {
-	const result: number[] = [];
-	const queue = new PQueue({concurrency: 1});
-	queue.add(async () => result.push(1), {priority: 1});
-	queue.add(async () => result.push(0), {priority: 0});
-	queue.add(async () => result.push(1), {priority: 1});
-	queue.add(async () => result.push(2), {priority: 1});
-	queue.add(async () => result.push(3), {priority: 2});
-	queue.add(async () => result.push(0), {priority: -1});
-	await queue.onEmpty();
-	t.deepEqual(result, [1, 3, 1, 2, 0, 0]);
-});
-
 test('.sizeBy() - priority', async t => {
 	const queue = new PQueue();
 	queue.pause();
@@ -117,6 +104,293 @@ test('.sizeBy() - priority', async t => {
 	await queue.onEmpty();
 	t.is(queue.sizeBy({priority: 1}), 0);
 	t.is(queue.sizeBy({priority: 0}), 0);
+});
+
+test('.setPriority() - raises priority of a waiting task', async t => {
+	const result: string[] = [];
+	const queue = new PQueue({concurrency: 1});
+
+	queue.add(() => result.push('a'), {id: 'a'});
+	queue.add(() => result.push('b'), {id: 'b'});
+	queue.add(() => result.push('c'), {id: 'c', priority: 1});
+
+	// `a` is already running; `b` waits at priority 0, `c` waits at priority 1
+	t.is(queue.pending, 1);
+	t.is(queue.size, 2);
+	queue.setPriority('b', 2);
+	t.deepEqual(result, ['a']);
+
+	await queue.onIdle();
+	t.deepEqual(result, ['a', 'b', 'c']);
+});
+
+test('.setPriority() - lowers priority of a waiting task', async t => {
+	const result: string[] = [];
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+
+	queue.add(() => result.push('a'), {id: 'a', priority: 2});
+	queue.add(() => result.push('b'), {id: 'b', priority: 1});
+	queue.add(() => result.push('c'), {id: 'c', priority: 1});
+
+	queue.setPriority('a', 0);
+	queue.start();
+	await queue.onIdle();
+	t.deepEqual(result, ['b', 'c', 'a']);
+});
+
+test('.setPriority() - keeps insertion order stable within the same priority', async t => {
+	const result: string[] = [];
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+
+	queue.add(() => result.push('a'), {id: 'a', priority: 1});
+	queue.add(() => result.push('b'), {id: 'b', priority: 1});
+	queue.add(() => result.push('c'), {id: 'c', priority: 1});
+
+	// Setting the same priority must not move the task
+	queue.setPriority('b', 1);
+	// Raising to another shared priority keeps the task's original insertion order
+	queue.add(() => result.push('d'), {id: 'd', priority: 5});
+	queue.setPriority('a', 5);
+
+	queue.start();
+	await queue.onIdle();
+	t.deepEqual(result, ['a', 'd', 'b', 'c']);
+});
+
+test('.setPriority() - on a paused queue, then start()', async t => {
+	const result: string[] = [];
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+
+	queue.add(() => result.push('a'), {id: 'a'});
+	queue.add(() => result.push('b'), {id: 'b'});
+	queue.add(() => result.push('c'), {id: 'c'});
+
+	t.is(queue.size, 3);
+	t.is(queue.pending, 0);
+	queue.setPriority('c', 1);
+	queue.start();
+	await queue.onIdle();
+	t.deepEqual(result, ['c', 'a', 'b']);
+});
+
+test('.setPriority() - new order is picked up as running tasks finish', async t => {
+	const {resolve, promise} = pDefer();
+	const result: string[] = [];
+	const queue = new PQueue({concurrency: 1});
+
+	queue.add(async () => promise, {id: 'running'});
+	queue.add(() => result.push('a'), {id: 'a'});
+	queue.add(() => result.push('b'), {id: 'b'});
+
+	// The update happens while the queue is blocked by the running task
+	t.is(queue.size, 2);
+	queue.setPriority('b', 1);
+	t.deepEqual(result, []);
+
+	resolve();
+	await queue.onIdle();
+	t.deepEqual(result, ['b', 'a']);
+});
+
+test('.setPriority() - keeps the original Promise and options', async t => {
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+	const controller = new AbortController();
+	const promise = queue.add(({signal}) => {
+		t.is(signal, controller.signal);
+		return fixture;
+	}, {id: 'a', priority: 0, signal: controller.signal});
+
+	queue.setPriority('a', 5);
+	queue.start();
+	t.is(await promise, fixture);
+});
+
+test('.setPriority() - throws when the task is already running', async t => {
+	const {resolve, promise} = pDefer();
+	const queue = new PQueue({concurrency: 1});
+	queue.add(async () => promise, {id: 'running'});
+
+	const error = t.throws(() => {
+		queue.setPriority('running', 1);
+	});
+	t.truthy(error);
+	t.regex(error!.message, /already started running/);
+
+	resolve();
+	await queue.onIdle();
+});
+
+test('.setPriority() - throws when the id is unknown', t => {
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+	queue.add(async () => 0, {id: 'a'});
+
+	const error = t.throws(() => {
+		queue.setPriority('missing', 1);
+	});
+	t.truthy(error);
+	t.regex(error!.message, /No waiting operation/);
+});
+
+test('.setPriority() - throws when the task never had an explicit id', t => {
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+	queue.add(async () => 0);
+
+	const error = t.throws(() => {
+		queue.setPriority('a', 1);
+	});
+	t.truthy(error);
+	t.regex(error!.message, /No waiting operation/);
+});
+
+test('.setPriority() - throws on an invalid priority', t => {
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+	queue.add(async () => 0, {id: 'a'});
+
+	for (const priority of [Number.POSITIVE_INFINITY, Number.NaN, '1']) {
+		t.throws(
+			() => {
+				// @ts-expect-error Testing invalid priority values
+				queue.setPriority('a', priority);
+			},
+			{instanceOf: TypeError},
+		);
+	}
+});
+
+test('.setPriority() - throws on an invalid id', t => {
+	const queue = new PQueue();
+
+	t.throws(
+		() => {
+			// @ts-expect-error Testing an invalid id value
+			queue.setPriority(undefined, 1);
+		},
+		{instanceOf: TypeError},
+	);
+});
+
+test('.add() - rejects when an id is reused by a waiting task', async t => {
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+	queue.add(async () => 0, {id: 'a'});
+
+	await t.throwsAsync(queue.add(async () => 0, {id: 'a'}), {message: /already queued or running/});
+});
+
+test('.add() - rejects when an id is reused by a running task', async t => {
+	const {resolve, promise} = pDefer();
+	const queue = new PQueue({concurrency: 1});
+	queue.add(async () => promise, {id: 'a'});
+
+	await t.throwsAsync(queue.add(async () => 0, {id: 'a'}), {message: /already queued or running/});
+
+	resolve();
+	await queue.onIdle();
+
+	// The id becomes available again once the task finishes
+	await t.notThrowsAsync(queue.add(async () => 0, {id: 'a'}));
+});
+
+test('.add() - rejects an invalid id', async t => {
+	const queue = new PQueue();
+
+	await t.throwsAsync(
+		// @ts-expect-error Testing an invalid id value
+		queue.add(async () => 0, {id: {}}),
+		{instanceOf: TypeError},
+	);
+});
+
+test('.clear() - releases ids of cleared waiting tasks', async t => {
+	const queue = new PQueue({autoStart: false});
+	queue.add(async () => 0, {id: 'a'});
+	queue.clear();
+
+	const promise = queue.add(async () => 0, {id: 'a'});
+	queue.start();
+	await t.notThrowsAsync(promise);
+});
+
+test('.setPriority() - works with a custom queueClass', t => {
+	const calls: Array<[string | number, number]> = [];
+
+	class CustomQueue {
+		readonly #queue: Array<{run: () => Promise<unknown>; id?: string | number; priority: number}> = [];
+
+		enqueue(run: () => Promise<unknown>, options: {id?: string; priority?: number} = {}): void {
+			this.#queue.push({run, id: options.id, priority: options.priority ?? 0});
+		}
+
+		dequeue() {
+			const item = this.#queue.shift();
+			return item?.run;
+		}
+
+		filter() {
+			return this.#queue.map(element => element.run);
+		}
+
+		setPriority(id: string | number, priority: number): void {
+			calls.push([id, priority]);
+			const item = this.#queue.find(element => element.id === id);
+			if (item) {
+				item.priority = priority;
+			}
+		}
+
+		get size() {
+			return this.#queue.length;
+		}
+	}
+
+	const queue = new PQueue({queueClass: CustomQueue, autoStart: false});
+	queue.add(async () => 0, {id: 'a'});
+	queue.setPriority('a', 3);
+
+	t.deepEqual(calls, [['a', 3]]);
+});
+
+test('.setPriority() - throws when the custom queueClass does not support it', t => {
+	class BareQueue {
+		readonly #queue: Array<() => Promise<unknown>> = [];
+
+		enqueue(run: () => Promise<unknown>): void {
+			this.#queue.push(run);
+		}
+
+		dequeue() {
+			return this.#queue.shift();
+		}
+
+		filter() {
+			return this.#queue;
+		}
+
+		get size() {
+			return this.#queue.length;
+		}
+	}
+
+	const queue = new PQueue({queueClass: BareQueue, autoStart: false});
+	queue.add(async () => 0, {id: 'a'});
+
+	const error = t.throws(() => {
+		queue.setPriority('a', 1);
+	});
+	t.truthy(error);
+	t.regex(error!.message, /does not implement `setPriority\(\)`/);
+});
+
+test('.add() - priority', async t => {
+	const result: number[] = [];
+	const queue = new PQueue({concurrency: 1});
+	queue.add(async () => result.push(1), {priority: 1});
+	queue.add(async () => result.push(0), {priority: 0});
+	queue.add(async () => result.push(1), {priority: 1});
+	queue.add(async () => result.push(2), {priority: 1});
+	queue.add(async () => result.push(3), {priority: 2});
+	queue.add(async () => result.push(0), {priority: -1});
+	await queue.onEmpty();
+	t.deepEqual(result, [1, 3, 1, 2, 0, 0]);
 });
 
 test('.add() - timeout without throwing', async t => {
