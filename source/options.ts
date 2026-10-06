@@ -32,7 +32,7 @@ export type Options<QueueType extends Queue<RunFunction, QueueOptions>, QueueOpt
 	readonly autoStart?: boolean;
 
 	/**
-	Class with a `enqueue` and `dequeue` method, and a `size` getter. See the [Custom QueueClass](https://github.com/sindresorhus/p-queue#custom-queueclass) section.
+	Class with a `enqueue` and `dequeue` method, and a `size` getter. See the [Custom QueueClass](https://github.com/sindresorhus/p-queue#custom-queueclass) section. The optional `setPriority` method is only required to support `queue.setPriority()`.
 	*/
 	readonly queueClass?: new () => QueueType;
 
@@ -69,6 +69,13 @@ export type QueueAddOptions = {
 	@default 0
 	*/
 	readonly priority?: number;
+
+	/**
+	Caller-provided unique identifier for the operation. It can later be passed to [`queue.setPriority()`](https://github.com/sindresorhus/p-queue#queuesetpriorityid-priority) to change the priority of a still-queued task.
+
+	Adding two tasks with the same `id` while the first one is still queued or running rejects the `add()` call with a `DuplicateTaskIdError`. An `id` can be reused once the task it identified has finished or was removed by `clear()`.
+	*/
+	readonly id?: string;
 } & TaskOptions & TimeoutOptions;
 
 export type TaskOptions = {

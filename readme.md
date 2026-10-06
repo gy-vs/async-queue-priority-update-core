@@ -139,6 +139,16 @@ Default: `0`
 
 Priority of operation. Operations with greater priority will be scheduled first.
 
+##### id
+
+Type: `string`
+
+A caller-provided identifier for the operation. It only has to be unique among the tasks that are currently queued or running. Passing an `id` lets you target the task later with [`queue.setPriority()`](#queuesetpriorityid-priority) while it is still waiting.
+
+Adding a second task with an `id` that is still queued or running rejects the returned promise with a `DuplicateTaskIdError`; the second task is not added. This makes the timeout-retry case predictable: the duplicate is always rejected instead of sometimes overtaking the original. Once the task with an `id` has finished, or has been removed by [`queue.clear()`](#clear), the `id` can be used again.
+
+Tasks added without an `id` are not affected and don't participate in duplicate detection.
+
 ##### signal
 
 [`AbortSignal`](https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal) for cancellation of the operation. When aborted, it will be removed from the queue and the `queue.add()` call will reject with an [error](https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/reason). If the operation is already running, the signal will need to be handled by the operation itself.
@@ -177,6 +187,58 @@ try {
 #### .addAll(fns, options?)
 
 Same as `.add()`, but accepts an array of sync or async functions and returns a promise that resolves when all functions are resolved.
+
+#### .setPriority(id, priority)
+
+Changes the priority of a task that is still waiting in the queue. The task is identified by the [`id`](#id) passed to `.add()`, and `priority` must be a finite number.
+
+The next dequeue uses the new priority — including when the queue is paused, in which case the changed order takes effect on the next `.start()`.
+
+The task is not re-created: the promise returned by the original `.add()` call is the same promise and still resolves with the task's result, and options such as `timeout` and `signal` stay attached to it.
+
+Ordering rules:
+
+- Within the same priority, tasks keep running first-in-first-out, as before.
+- When a task is moved into another priority, it is placed **behind** every task that was already waiting in that priority tier.
+- Setting the same priority the task already has is a no-op and keeps its position.
+
+This makes repeated calls deterministic: the same sequence of `add()` and `setPriority()` calls always produces the same run order.
+
+```js
+import PQueue from 'p-queue';
+
+const queue = new PQueue({concurrency: 1});
+
+queue.add(exportReport, {id: 'export-417', priority: 0});
+queue.add(exportReport, {id: 'export-418', priority: 0});
+
+// Customer support marks export 418 as urgent.
+queue.setPriority('export-418', 10);
+//=> export-418 runs before export-417
+```
+
+Throws:
+
+- `TypeError` — `priority` is not a finite number.
+- `TaskNotFoundError` — no queued or running task has this `id` (it never existed, already finished, or was removed by `.clear()`).
+- `TaskRunningError` — the task with this `id` has already started running and is no longer in the queue.
+- `TypeError` — the configured [custom queue class](#custom-queueclass) does not implement `setPriority()`.
+
+The error classes are exported:
+
+```js
+import PQueue, {TaskNotFoundError, TaskRunningError} from 'p-queue';
+
+try {
+	queue.setPriority('export-418', 10);
+} catch (error) {
+	if (error instanceof TaskRunningError) {
+		// Already running, too late.
+	} else if (error instanceof TaskNotFoundError) {
+		// Unknown id.
+	}
+}
+```
 
 #### .pause()
 
@@ -237,6 +299,8 @@ console.log(queue.sizeBy({priority: 1}));
 console.log(queue.sizeBy({priority: 0}));
 //=> 1
 ```
+
+The same applies to any other add option, including `id` — `queue.sizeBy({id: 'export-1'})` is `1` while that task is queued. After `queue.setPriority()`, counts filtered by `priority` immediately reflect the new priority.
 
 #### .pending
 
@@ -481,6 +545,29 @@ const queue = new PQueue({queueClass: QueueClass});
 ```
 
 `p-queue` will call corresponding methods to put and get operations from this queue.
+
+A queue class only has to implement `enqueue()`, `dequeue()`, `size` and `filter()`, so existing custom queues keep working unchanged. Supporting `queue.setPriority()` is opt-in: add an optional `setPriority(id, priority)` method, matching the `Queue` interface exported from this package:
+
+```ts
+import PQueue, {type Queue, type QueueAddOptions, type RunFunction} from 'p-queue';
+
+class MyQueue implements Queue<RunFunction, QueueAddOptions> {
+	// …enqueue(), dequeue(), size and filter() as above…
+
+	// Return `false` when no queued task has the given id; otherwise move it
+	// and return `true`.
+	setPriority(id: string, priority: number): boolean {
+		// Find the stored task by the `id` it was enqueued with, change its
+		// priority, and reposition it according to this queue's scheduling.
+	}
+}
+```
+
+The method receives the same `id` and `priority` that `queue.setPriority(id, priority)` was called with. It must not replace the task or re-enqueue it with different options: the run function and the options from the original `.add()` call are preserved, only the priority (and therefore the dequeue position) changes. It returns `false` when no queued task has the given `id`, and `true` when it reprioritized one.
+
+If a custom queue does not implement `setPriority()`, constructing the queue, adding tasks and calling `sizeBy()` all work as before; only calling `queue.setPriority()` throws a `TypeError` explaining that the configured queue class does not support it.
+
+The built-in priority queue keeps tasks in priority order, first-in-first-out within a priority tier. When `setPriority()` moves a task into another tier, that queue places it behind the tasks already waiting in that tier; custom queues define their own tie-breaking, as long as it is stable.
 
 ## FAQ
 
