@@ -69,6 +69,13 @@ export type QueueAddOptions = {
 	@default 0
 	*/
 	readonly priority?: number;
+
+	/**
+	Unique identifier of the operation.
+
+	Used to address the queued operation with `queue.setPriority()` while it is waiting to run. The `id` must be unique among the queued and running operations of a queue: adding another operation with the same `id` while it is still queued or running throws a `DuplicateTaskIdError`. The `id` can be reused after the operation has finished or after it has been removed with `clear()`.
+	*/
+	readonly id?: string;
 } & TaskOptions & TimeoutOptions;
 
 export type TaskOptions = {

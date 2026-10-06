@@ -6,7 +6,8 @@ import inRange from 'in-range';
 import timeSpan from 'time-span';
 import randomInt from 'random-int';
 import pDefer from 'p-defer';
-import PQueue, {AbortError} from '../source/index.js';
+import {TimeoutError} from 'p-timeout';
+import PQueue, {AbortError, DuplicateTaskIdError, QueueDoesNotSupportSetPriorityError, TaskNotFoundError, TaskRunningError} from '../source/index.js';
 
 const fixture = Symbol('fixture');
 
@@ -1133,4 +1134,358 @@ test('aborting multiple jobs at the same time', async t => {
 	await t.throwsAsync(task1, {instanceOf: DOMException});
 	await t.throwsAsync(task2, {instanceOf: DOMException});
 	t.like(queue, {size: 0, pending: 0});
+});
+
+class CustomQueueClass {
+	readonly queue: Array<() => void> = [];
+
+	enqueue(run: () => void): void {
+		this.queue.push(run);
+	}
+
+	dequeue(): (() => void) | undefined {
+		return this.queue.shift();
+	}
+
+	get size(): number {
+		return this.queue.length;
+	}
+
+	filter(): Array<() => void> {
+		return this.queue;
+	}
+}
+
+class PriorityAwareCustomQueueClass extends CustomQueueClass {
+	static lastSetPriorityCall?: {id: string; priority: number};
+
+	enqueue(run: () => void, options?: {id?: string; priority?: number}): void {
+		if (options?.id !== undefined) {
+			const stored = run as (() => void) & {id?: string; priority?: number};
+			stored.id = options.id;
+			stored.priority = options.priority ?? 0;
+		}
+
+		super.enqueue(run);
+	}
+
+	setPriority(id: string, priority: number): void {
+		PriorityAwareCustomQueueClass.lastSetPriorityCall = {id, priority};
+
+		for (const run of this.queue) {
+			if ((run as {id?: string}).id === id) {
+				(run as {priority?: number}).priority = priority;
+			}
+		}
+	}
+
+	priorityOf(id: string): number | undefined {
+		for (const run of this.queue) {
+			const stored = run as {id?: string; priority?: number};
+			if (stored.id === id) {
+				return stored.priority;
+			}
+		}
+
+		return undefined;
+	}
+}
+
+test('.add() - accepts an id option', async t => {
+	const queue = new PQueue({concurrency: 1});
+	await t.notThrowsAsync(queue.add(async () => fixture, {id: 'task-1'}));
+});
+
+test('.setPriority() - moves a queued task forward', async t => {
+	const queue = new PQueue({concurrency: 1});
+	const gate = pDefer<void>();
+	const result: string[] = [];
+
+	queue.add(async () => {
+		await gate.promise;
+		result.push('running');
+	}, {id: 'running', priority: 0});
+	const lowA = queue.add(async () => result.push('low-a'), {id: 'low-a', priority: 0});
+	const lowB = queue.add(async () => result.push('low-b'), {id: 'low-b', priority: 0});
+	const high = queue.add(async () => result.push('high'), {id: 'high', priority: 0});
+
+	queue.setPriority('high', 10);
+
+	gate.resolve();
+	await Promise.all([lowA, lowB, high]);
+
+	t.deepEqual(result, ['running', 'high', 'low-a', 'low-b']);
+});
+
+test('.setPriority() - pushes a queued task back', async t => {
+	const queue = new PQueue({concurrency: 1});
+	const gate = pDefer<void>();
+	const result: string[] = [];
+
+	queue.add(async () => {
+		await gate.promise;
+		result.push('running');
+	}, {id: 'running', priority: 0});
+	const demoted = queue.add(async () => result.push('demoted'), {id: 'demoted', priority: 5});
+	const other = queue.add(async () => result.push('other'), {id: 'other', priority: 0});
+
+	queue.setPriority('demoted', -5);
+
+	gate.resolve();
+	await Promise.all([demoted, other]);
+
+	t.deepEqual(result, ['running', 'other', 'demoted']);
+});
+
+test('.setPriority() - task moved into a priority tier goes behind tasks already in that tier', async t => {
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+	const result: string[] = [];
+
+	queue.add(async () => result.push('a'), {id: 'a', priority: 0});
+	queue.add(async () => result.push('b'), {id: 'b', priority: 1});
+	queue.add(async () => result.push('c'), {id: 'c', priority: 0});
+
+	// Moving `a` and `c` into the existing priority-1 tier places them behind `b`, in move order.
+	queue.setPriority('a', 1);
+	queue.setPriority('c', 1);
+
+	queue.start();
+	await queue.onIdle();
+
+	t.deepEqual(result, ['b', 'a', 'c']);
+});
+
+test('.setPriority() - same priority tasks keep FIFO order', async t => {
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+	const result: string[] = [];
+
+	queue.add(async () => result.push('a'), {id: 'a', priority: 1});
+	queue.add(async () => result.push('b'), {id: 'b', priority: 1});
+	queue.add(async () => result.push('c'), {id: 'c', priority: 1});
+
+	// Setting the same priority must not move the task.
+	queue.setPriority('a', 1);
+	queue.setPriority('b', 1);
+
+	queue.start();
+	await queue.onIdle();
+
+	t.deepEqual(result, ['a', 'b', 'c']);
+});
+
+test('.setPriority() - order applies after resume from pause', async t => {
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+	const result: string[] = [];
+
+	queue.add(async () => result.push('a'), {id: 'a', priority: 0});
+	queue.add(async () => result.push('b'), {id: 'b', priority: 0});
+	queue.add(async () => result.push('c'), {id: 'c', priority: 0});
+
+	queue.setPriority('c', 10);
+
+	queue.start();
+	await queue.onIdle();
+
+	t.deepEqual(result, ['c', 'a', 'b']);
+});
+
+test('.setPriority() - updates sizeBy() counts immediately', t => {
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+
+	queue.add(async () => {}, {id: 'a', priority: 0}); // eslint-disable-line @typescript-eslint/no-empty-function
+	queue.add(async () => {}, {id: 'b', priority: 0}); // eslint-disable-line @typescript-eslint/no-empty-function
+
+	t.is(queue.sizeBy({priority: 0}), 2);
+	t.is(queue.sizeBy({priority: 5}), 0);
+
+	queue.setPriority('b', 5);
+
+	t.is(queue.sizeBy({priority: 0}), 1);
+	t.is(queue.sizeBy({priority: 5}), 1);
+	t.is(queue.size, 2);
+});
+
+test('.setPriority() - does not replace the task: same promise, timeout and signal options stay attached', async t => {
+	const queue = new PQueue({concurrency: 1, autoStart: false, timeout: 300, throwOnTimeout: true});
+
+	const original = queue.add(async () => fixture, {id: 'task'});
+	queue.setPriority('task', 10);
+
+	queue.start();
+	t.is(await original, fixture);
+});
+
+test('.setPriority() - timeout still applies after the task is moved', async t => {
+	const queue = new PQueue({concurrency: 1});
+	const gate = pDefer<void>();
+
+	queue.add(async () => gate.promise);
+	const moved = queue.add(async () => new Promise(() => {}), {id: 'slow', priority: 0, timeout: 50, throwOnTimeout: true}); // eslint-disable-line @typescript-eslint/no-empty-function
+	queue.setPriority('slow', 10);
+
+	gate.resolve();
+	await t.throwsAsync(moved, {instanceOf: TimeoutError});
+});
+
+test('.setPriority() - throws TaskRunningError when the task is already running', t => {
+	const queue = new PQueue({concurrency: 1});
+	const gate = pDefer();
+
+	queue.add(async () => gate.promise, {id: 'task'});
+	const error = t.throws(() => {
+		queue.setPriority('task', 10);
+	});
+
+	t.true(error instanceof TaskRunningError);
+	t.is(error.id, 'task');
+	t.false(error instanceof TaskNotFoundError);
+
+	gate.resolve();
+});
+
+test('.setPriority() - throws TaskNotFoundError when the id is unknown', t => {
+	const queue = new PQueue();
+	const error = t.throws(() => {
+		queue.setPriority('missing', 10);
+	});
+
+	t.true(error instanceof TaskNotFoundError);
+	t.is((error as TaskNotFoundError).id, 'missing');
+	t.false(error instanceof TaskRunningError);
+});
+
+test('.setPriority() - throws TaskNotFoundError after the task has finished', async t => {
+	const queue = new PQueue({concurrency: 1});
+	await queue.add(async () => fixture, {id: 'task'});
+
+	t.throws(() => {
+		queue.setPriority('task', 10);
+	}, {instanceOf: TaskNotFoundError});
+});
+
+test('.setPriority() - rejects non-finite priorities', t => {
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+	queue.add(async () => {}, {id: 'task'}); // eslint-disable-line @typescript-eslint/no-empty-function
+
+	for (const priority of [Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NaN]) {
+		t.throws(() => {
+			queue.setPriority('task', priority);
+		}, {instanceOf: TypeError});
+	}
+});
+
+test('.setPriority() - rejects non-numeric priorities', t => {
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+	queue.add(async () => {}, {id: 'task'}); // eslint-disable-line @typescript-eslint/no-empty-function
+
+	t.throws(() => {
+		// @ts-expect-error Testing invalid input
+		queue.setPriority('task', '10');
+	}, {instanceOf: TypeError});
+});
+
+test('.add() - throws DuplicateTaskIdError when the id is already queued', async t => {
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+	queue.add(async () => {}, {id: 'task'}); // eslint-disable-line @typescript-eslint/no-empty-function
+
+	await t.throwsAsync(
+		queue.add(async () => {}, {id: 'task'}), // eslint-disable-line @typescript-eslint/no-empty-function
+		{instanceOf: DuplicateTaskIdError},
+	);
+
+	t.is(queue.size, 1);
+});
+
+test('.add() - throws DuplicateTaskIdError when the id is already running', async t => {
+	const queue = new PQueue({concurrency: 1});
+	const gate = pDefer();
+	queue.add(async () => gate.promise, {id: 'task'});
+
+	await t.throwsAsync(
+		queue.add(async () => {}, {id: 'task'}), // eslint-disable-line @typescript-eslint/no-empty-function
+		{instanceOf: DuplicateTaskIdError},
+	);
+
+	gate.resolve();
+});
+
+test('.add() - an id can be reused after the task finished', async t => {
+	const queue = new PQueue({concurrency: 1});
+
+	t.is(await queue.add(async () => 'first', {id: 'task'}), 'first');
+	t.is(await queue.add(async () => 'second', {id: 'task'}), 'second');
+});
+
+test('.clear() - releases queued task ids', async t => {
+	const queue = new PQueue({concurrency: 1, autoStart: false});
+	queue.add(async () => {}, {id: 'task'}); // eslint-disable-line @typescript-eslint/no-empty-function
+
+	queue.clear();
+
+	t.throws(() => {
+		queue.setPriority('task', 10);
+	}, {instanceOf: TaskNotFoundError});
+
+	queue.start();
+	await t.notThrowsAsync(queue.add(async () => fixture, {id: 'task'}));
+});
+
+test('.clear() - keeps ids of running tasks', t => {
+	const queue = new PQueue({concurrency: 1});
+	const gate = pDefer();
+
+	queue.add(async () => gate.promise, {id: 'running'});
+	queue.add(async () => {}, {id: 'queued'}); // eslint-disable-line @typescript-eslint/no-empty-function
+	queue.clear();
+
+	t.throws(() => {
+		queue.setPriority('queued', 10);
+	}, {instanceOf: TaskNotFoundError});
+
+	t.throws(() => {
+		queue.setPriority('running', 10);
+	}, {instanceOf: TaskRunningError});
+
+	gate.resolve();
+});
+
+test('custom QueueClass without setPriority - construction, add and sizeBy keep working', async t => {
+	const queue = new PQueue({concurrency: 1, autoStart: false, queueClass: CustomQueueClass});
+
+	t.notThrows(() => {
+		queue.add(async () => {}); // eslint-disable-line @typescript-eslint/no-empty-function
+		queue.add(async () => {}); // eslint-disable-line @typescript-eslint/no-empty-function
+	});
+
+	t.is(queue.size, 2);
+	t.is(queue.sizeBy({priority: 0}), 2);
+
+	queue.start();
+	await queue.onIdle();
+});
+
+test('custom QueueClass without setPriority - throws only when setPriority is called', async t => {
+	const queue = new PQueue({concurrency: 1, autoStart: false, queueClass: CustomQueueClass});
+	const task = queue.add(async () => fixture, {id: 'task'});
+
+	t.throws(() => {
+		queue.setPriority('task', 10);
+	}, {instanceOf: QueueDoesNotSupportSetPriorityError});
+
+	queue.start();
+	t.is(await task, fixture);
+});
+
+test('custom QueueClass can implement the public setPriority contract', async t => {
+	const queue = new PQueue({concurrency: 1, autoStart: false, queueClass: PriorityAwareCustomQueueClass});
+	const run = queue.add(async () => fixture, {id: 'task', priority: 0});
+
+	t.notThrows(() => {
+		queue.setPriority('task', 10);
+	});
+
+	t.deepEqual(PriorityAwareCustomQueueClass.lastSetPriorityCall, {id: 'task', priority: 10});
+
+	queue.start();
+	t.is(await run, fixture);
 });

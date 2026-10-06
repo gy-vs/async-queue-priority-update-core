@@ -16,20 +16,12 @@ export default class PriorityQueue implements Queue<RunFunction, PriorityQueueOp
 		};
 
 		const element = {
+			id: options.id,
 			priority: options.priority,
 			run,
 		};
 
-		if (this.size && this.#queue[this.size - 1]!.priority! >= options.priority!) {
-			this.#queue.push(element);
-			return;
-		}
-
-		const index = lowerBound(
-			this.#queue, element,
-			(a: Readonly<PriorityQueueOptions>, b: Readonly<PriorityQueueOptions>) => b.priority! - a.priority!,
-		);
-		this.#queue.splice(index, 0, element);
+		this.#insert(element);
 	}
 
 	dequeue(): RunFunction | undefined {
@@ -43,7 +35,39 @@ export default class PriorityQueue implements Queue<RunFunction, PriorityQueueOp
 		).map((element: Readonly<{run: RunFunction}>) => element.run);
 	}
 
+	setPriority(id: string, priority: number): void {
+		const index = this.#queue.findIndex(element => element.id === id);
+
+		if (index === -1 || this.#queue[index]!.priority === priority) {
+			return;
+		}
+
+		const [element] = this.#queue.splice(index, 1) as [PriorityQueueOptions & {run: RunFunction}];
+		element.priority = priority;
+
+		let destination = 0;
+		while (destination < this.#queue.length && this.#queue[destination]!.priority! >= priority) {
+			destination++;
+		}
+
+		// Insert behind every element already in the target priority tier, preserving FIFO within the tier.
+		this.#queue.splice(destination, 0, element);
+	}
+
 	get size(): number {
 		return this.#queue.length;
+	}
+
+	#insert(element: PriorityQueueOptions & {run: RunFunction}): void {
+		if (this.size && this.#queue[this.size - 1]!.priority! >= element.priority!) {
+			this.#queue.push(element);
+			return;
+		}
+
+		const index = lowerBound(
+			this.#queue, element,
+			(a: Readonly<PriorityQueueOptions>, b: Readonly<PriorityQueueOptions>) => b.priority! - a.priority!,
+		);
+		this.#queue.splice(index, 0, element);
 	}
 }

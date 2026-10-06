@@ -3,6 +3,7 @@ import pTimeout, {TimeoutError} from 'p-timeout';
 import {type Queue, type RunFunction} from './queue.js';
 import PriorityQueue from './priority-queue.js';
 import {type QueueAddOptions, type Options, type TaskOptions} from './options.js';
+import {DuplicateTaskIdError, QueueDoesNotSupportSetPriorityError, TaskNotFoundError, TaskRunningError} from './errors.js';
 
 type Task<TaskResultType> =
 	| ((options: TaskOptions) => PromiseLike<TaskResultType>)
@@ -35,6 +36,11 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	readonly #queueClass: new () => QueueType;
 
 	#pending = 0;
+
+	/**
+	Tracks the lifecycle of tasks added with an `id`, so they can be addressed later by `setPriority()`.
+	*/
+	readonly #taskIds = new Map<string, 'queued' | 'running'>();
 
 	// The `!` is needed because of https://github.com/microsoft/TypeScript/issues/32194
 	#concurrency!: number;
@@ -240,8 +246,16 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 			...options,
 		};
 
+		if (options.id !== undefined && this.#taskIds.has(options.id)) {
+			throw new DuplicateTaskIdError(options.id);
+		}
+
 		return new Promise((resolve, reject) => {
 			this.#queue.enqueue(async () => {
+				if (options.id !== undefined) {
+					this.#taskIds.set(options.id, 'running');
+				}
+
 				this.#pending++;
 				this.#intervalCount++;
 
@@ -270,9 +284,17 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 					reject(error);
 					this.emit('error', error);
 				} finally {
+					if (options.id !== undefined) {
+						this.#taskIds.delete(options.id);
+					}
+
 					this.#next();
 				}
 			}, options);
+
+			if (options.id !== undefined) {
+				this.#taskIds.set(options.id, 'queued');
+			}
 
 			this.emit('add');
 
@@ -326,6 +348,44 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	*/
 	clear(): void {
 		this.#queue = new this.#queueClass();
+		this.#clearQueuedTaskIds();
+	}
+
+	#clearQueuedTaskIds(): void {
+		for (const [id, state] of this.#taskIds) {
+			if (state === 'queued') {
+				this.#taskIds.delete(id);
+			}
+		}
+	}
+
+	/**
+	Changes the priority of a queued task.
+
+	The task must have been added with an `id` and must still be waiting in the queue. The next dequeue uses the new priority; the task itself (the promise returned by `add()`, its timeout and signal options) is unchanged.
+
+	Throws a `TaskNotFoundError` when no queued task has the given `id` (unknown id, already finished, or removed by `clear()`), and a `TaskRunningError` when the task has already started running. Throws a `TypeError` when `priority` is not a finite number, and a `QueueDoesNotSupportSetPriorityError` when the configured custom QueueClass does not support changing priorities.
+	*/
+	setPriority(id: string, priority: number): void {
+		if (typeof priority !== 'number' || !Number.isFinite(priority)) {
+			throw new TypeError(`Expected \`priority\` to be a finite number, got \`${priority}\` (${typeof priority})`);
+		}
+
+		const state = this.#taskIds.get(id);
+
+		if (state === undefined) {
+			throw new TaskNotFoundError(id);
+		}
+
+		if (state === 'running') {
+			throw new TaskRunningError(id);
+		}
+
+		if (this.#queue.setPriority === undefined) {
+			throw new QueueDoesNotSupportSetPriorityError(this.#queueClass.name || 'QueueClass');
+		}
+
+		this.#queue.setPriority(id, priority);
 	}
 
 	/**
@@ -419,5 +479,6 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	}
 }
 
-export type {Queue} from './queue.js';
+export type {Queue, RunFunction} from './queue.js';
 export {type QueueAddOptions, type Options} from './options.js';
+export {DuplicateTaskIdError, QueueDoesNotSupportSetPriorityError, TaskNotFoundError, TaskRunningError} from './errors.js';

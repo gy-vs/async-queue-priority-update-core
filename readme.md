@@ -139,6 +139,16 @@ Default: `0`
 
 Priority of operation. Operations with greater priority will be scheduled first.
 
+##### id
+
+Type: `string`
+
+Unique identifier of the operation. It only needs to be provided if you want to address the operation later with [`.setPriority()`](#setpriorityid-priority) while it is still queued.
+
+The `id` must be unique among the queued and running operations of a queue. Adding another operation with an `id` that is still queued or running rejects the returned promise with a `DuplicateTaskIdError`. The `id` is released when the operation settles (resolves or rejects) or when it is removed by [`.clear()`](#clear), so it can be reused afterwards. This makes the behavior predictable when the same request is submitted more than once (for example because of a timeout retry): the duplicate submission fails fast instead of silently updating an existing operation, and [`.setPriority()`](#setpriorityid-priority) always operates on the one operation that was added with the `id`.
+
+Operations without an `id` are not affected and do not collide with anything.
+
 ##### signal
 
 [`AbortSignal`](https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal) for cancellation of the operation. When aborted, it will be removed from the queue and the `queue.add()` call will reject with an [error](https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/reason). If the operation is already running, the signal will need to be handled by the operation itself.
@@ -177,6 +187,32 @@ try {
 #### .addAll(fns, options?)
 
 Same as `.add()`, but accepts an array of sync or async functions and returns a promise that resolves when all functions are resolved.
+
+#### .setPriority(id, priority)
+
+Changes the priority of a queued operation. The operation must have been added with an [`id`](#id) and must still be waiting to run. The next dequeue uses the new priority.
+
+It does not create a new operation: the promise returned by `.add()` is unchanged and still resolves or rejects with the operation's result, and the operation keeps its `timeout`, `signal` and other options.
+
+- `priority` must be a finite number. Invalid values throw a `TypeError`.
+- If no queued operation has the given `id` (unknown `id`, the operation has already finished, or it was removed by `.clear()`), it throws a `TaskNotFoundError`.
+- If the operation with the given `id` has already started running, it throws a `TaskRunningError`. Its priority can no longer be changed.
+- If a custom [QueueClass](#custom-queueclass) is used that does not implement the optional `setPriority` method, it throws a `QueueDoesNotSupportSetPriorityError`.
+
+When an operation is moved into another priority level, it is placed behind the operations that were already queued in that level. Within the same priority level, operations still run in insertion order (FIFO). Setting the same priority the operation already has does not move it.
+
+```js
+import PQueue from 'p-queue';
+
+const queue = new PQueue({concurrency: 1});
+
+queue.add(() => exportReport(), {id: 'export-42'});
+
+// Support marks the export as urgent.
+queue.setPriority('export-42', 10);
+```
+
+The same ordering is used while the queue is paused: priorities changed with `.pause()` active take effect when `.start()` is called, and `.sizeBy({priority})` reflects the new priority immediately.
 
 #### .pause()
 
@@ -481,6 +517,19 @@ const queue = new PQueue({queueClass: QueueClass});
 ```
 
 `p-queue` will call corresponding methods to put and get operations from this queue.
+
+A QueueClass must implement this interface:
+
+- `enqueue(run, options)` — add an operation. `options` is the options object passed to `.add()`, including the optional `id` and `priority`.
+- `dequeue()` — return the next operation to run, or `undefined` when empty.
+- `size` — the number of queued operations.
+- `filter(options)` — return the queued operations matching `options`, used by `.sizeBy()`.
+
+Supporting `.setPriority()` is optional. A QueueClass that does not implement it keeps working exactly as before; `queue.setPriority()` only throws a `QueueDoesNotSupportSetPriorityError` when actually called. To support it, implement:
+
+- `setPriority(id, priority)` — change the priority of the previously enqueued operation with the given `id`. The `id` is the value the operation was enqueued with through `enqueue(run, {id})`, so the QueueClass is expected to keep that association itself; it must not rely on the internals of the built-in `PriorityQueue`.
+
+Only operations that are still queued will be addressed this way: `p-queue` performs the `id` and state checks itself, so this method does not have to handle running or unknown operations.
 
 ## FAQ
 
